@@ -1,23 +1,21 @@
 import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import path from 'path';
-import { defineConfig } from 'vite';
-import apiApp from './server';
+import { defineConfig, Plugin } from 'vite';
+import { app } from './server';
+
+function acesuApiBackend(): Plugin {
+  return {
+    name: 'acesu-api-backend',
+    configureServer(server) {
+      server.middlewares.use(app);
+    },
+  };
+}
 
 export default defineConfig(() => {
   return {
-    plugins: [
-      react(),
-      tailwindcss(),
-      {
-        name: 'acesu-api-backend',
-        configureServer(server) {
-          // O AI Studio pode iniciar o Vite diretamente. Neste caso, as rotas
-          // Express precisam ser montadas antes do fallback SPA/index.html.
-          server.middlewares.use(apiApp);
-        },
-      },
-    ],
+    plugins: [react(), tailwindcss(), acesuApiBackend()],
     resolve: {
       alias: {
         '@': path.resolve(__dirname, '.'),

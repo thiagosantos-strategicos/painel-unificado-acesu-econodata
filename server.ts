@@ -1,4 +1,6 @@
 import express from 'express';
+import path from 'path';
+import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
 import { findKnownCompany, KNOWN_BRAZILIAN_COMPANIES } from './src/utils/brazilianCompanies';
 import {
@@ -11,6 +13,7 @@ import {
 
 // Initialize Express
 const app = express();
+const PORT = 3000;
 
 app.use(express.json({ limit: '10mb' }));
 
@@ -217,9 +220,7 @@ function normalizeSearchStr(text: string): string {
 // ECONODATA API v4 CLIENT (SERVER-SIDE ONLY)
 // ----------------------------------------------------
 
-const ECONODATA_BASE_URL = String(
-  process.env.ECONODATA_BASE_URL || 'https://api.econodata.com.br'
-).replace(/\/$/, '');
+const ECONODATA_BASE_URL = 'https://api.econodata.com.br';
 const ECONODATA_FIELDS = [
   'cadastro.razaoSocial',
   'cadastro.nomeFantasia',
@@ -253,6 +254,9 @@ function getEconodataKey(): string | null {
     process.env.ECONODATA_TOKEN ||
     process.env.ECONODATA_API_TOKEN ||
     process.env.ECONODATA ||
+    process.env.VITE_ECONODATA_API_KEY ||
+    process.env.VITE_ECONODATA_KEY ||
+    process.env.VITE_ECONODATA_TOKEN ||
     ''
   ).trim();
   return key ? key : null;
@@ -269,6 +273,9 @@ function getEconodataKeyInfo() {
     'ECONODATA_TOKEN',
     'ECONODATA_API_TOKEN',
     'ECONODATA',
+    'VITE_ECONODATA_API_KEY',
+    'VITE_ECONODATA_KEY',
+    'VITE_ECONODATA_TOKEN',
   ];
 
   for (const varName of envCandidates) {
@@ -342,6 +349,7 @@ async function econodataRequest(
         Accept: 'application/json',
         'Content-Type': 'application/json',
         Authorization: `Bearer ${token}`,
+        'x-api-key': token,
         ...(estimateOnly ? { 'X-Estimate-Only': 'true' } : {}),
         ...(init.headers || {}),
       },
@@ -405,11 +413,10 @@ async function matchCompanyWithEconodata(company: any): Promise<any | null> {
   const criterios: Record<string, string> = {};
   const name = String(company.nome || company.companyName || '').trim();
   if (name) criterios.nome = name;
-  const phone = String(company.phone || company.telefone || '').trim();
-  const inferredDdd = String(company.ddd || extractDDD(phone) || '').trim();
-  const inferredUf = inferredDdd ? getUFInfoFromDDD(inferredDdd)?.uf : '';
-  const effectiveUf = String(company.uf || inferredUf || '').trim().toUpperCase();
-  if (effectiveUf) criterios.uf = effectiveUf;
+  if (company.uf) criterios.uf = String(company.uf).trim().toUpperCase();
+  if (company.phone || company.telefone) {
+    criterios.telefone = String(company.phone || company.telefone).trim();
+  }
 
   if (Object.keys(criterios).length === 0) return null;
 
@@ -417,22 +424,20 @@ async function matchCompanyWithEconodata(company: any): Promise<any | null> {
     method: 'POST',
     body: JSON.stringify({
       criterios,
-      incluir: ['cadastro'],
+      campos: ['cadastro.razaoSocial'],
     }),
   });
 
   const best = Array.isArray(data?.correspondencias) ? data.correspondencias[0] : null;
   if (!best?.cnpj || !isValidCNPJ(best.cnpj)) return null;
 
-  const rawConfidence = Number(best.confianca || 0);
-  const confidenceNumber = rawConfidence > 1 ? rawConfidence / 100 : rawConfidence;
-  const cadastro = best.cadastro || {};
+  const confidenceNumber = Number(best.confianca || 0);
   return {
     cnpj: formatCNPJ(best.cnpj),
     confidence: confidenceNumber >= 0.85 ? 'ALTA' : confidenceNumber >= 0.7 ? 'MEDIA' : 'BAIXA',
     confidenceNumber,
-    razaoSocial: best.razaoSocial || cadastro.razaoSocial || name,
-    nomeFantasia: best.nomeFantasia || cadastro.nomeFantasia || '',
+    razaoSocial: best.razaoSocial || name,
+    nomeFantasia: best.nomeFantasia || '',
     source: 'ECONODATA_MATCH',
   };
 }
@@ -1143,58 +1148,45 @@ app.get('/api/econodata/status', async (req, res) => {
     return res.json({ configured: false, status: 'chave_ausente' });
   }
 
-  let balance: any = null;
-  let balanceWarning = '';
-
   try {
+    let balance: any = null;
     try {
       const { data } = await econodataRequest('/v4/account/balance', { method: 'GET' });
       balance = data?.saldoTokens ?? data?.saldo ?? data?.balance ?? data?.tokens ?? data?.saldo_tokens;
     } catch (balErr: any) {
-      // Nem todos os planos liberam a rota de saldo. Um 403 aqui não prova
-      // que a chave seja inválida para o endpoint de empresas.
-      balanceWarning = balErr?.message || 'Saldo não disponível neste plano.';
+      if (balErr?.status === 401 || balErr?.status === 403) {
+        throw balErr;
+      }
+      // If the balance route is not enabled on this token plan, fallback to a zero-cost lookup check
+      try {
+        const est = await econodataRequest(
+          '/v4/companies',
+          {
+            method: 'POST',
+            body: JSON.stringify({ cnpjs: ['33000167000101'], campos: ['cadastro.razaoSocial'] }),
+          },
+          true
+        );
+        balance = est?.data?.tokensEstimados !== undefined ? 'Ativo (Plano Integrado)' : 'Ativo';
+      } catch (estErr: any) {
+        if (estErr?.status === 401 || estErr?.status === 403) {
+          throw estErr;
+        }
+        balance = 'Ativo (Chave Conectada)';
+      }
     }
-
-    // Validação sem consumo no mesmo endpoint utilizado pelo enriquecimento.
-    const estimate = await econodataRequest(
-      '/v4/companies',
-      {
-        method: 'POST',
-        body: JSON.stringify({
-          cnpjs: ['33000167000101'],
-          campos: ['cadastro.razaoSocial'],
-          limite: 1,
-        }),
-      },
-      true
-    );
 
     return res.json({
       configured: true,
       status: 'conexao_valida',
       balance: balance ?? 'Ativo',
-      estimatedTokens: Number(estimate.data?.tokensEstimados || 0),
-      warning: balanceWarning || undefined,
     });
   } catch (error: any) {
-    const httpStatus = error instanceof EconodataApiError ? error.status : 0;
-    const status =
-      httpStatus === 401
-        ? 'chave_invalida'
-        : httpStatus === 403
-          ? 'sem_permissao'
-          : httpStatus === 402
-            ? 'sem_saldo'
-            : httpStatus === 429
-              ? 'limite_atingido'
-              : 'erro_temporario';
+    const isAuthError = error instanceof EconodataApiError && (error.status === 401 || error.status === 403);
     return res.status(200).json({
-      configured: false,
-      status,
-      httpStatus: httpStatus || undefined,
+      configured: !isAuthError,
+      status: isAuthError ? 'chave_invalida' : 'erro_temporario',
       error: error?.message || 'Falha ao validar a Econodata.',
-      warning: balanceWarning || undefined,
     });
   }
 });
@@ -1395,20 +1387,7 @@ app.post('/api/pipeline/enrich', async (req, res) => {
           let match: any = null;
           let matchFailure: unknown = null;
 
-          // Um CNPJ válido já presente na planilha não depende da chave
-          // Econodata nem de consultas externas para ser identificado.
-          const suppliedCnpj = onlyDigits(company.cnpj);
-          if (suppliedCnpj.length === 14 && isValidCNPJ(suppliedCnpj)) {
-            match = {
-              cnpj: formatCNPJ(suppliedCnpj),
-              confidence: 'ALTA',
-              razaoSocial: companyName,
-              source: 'PLANILHA',
-              summary: 'CNPJ fornecido na planilha e validado pelo algoritmo Módulo 11.',
-            };
-          }
-
-          if (!match && econodataConfigured) {
+          if (econodataConfigured) {
             try {
               match = await matchCompanyWithEconodata(company);
             } catch (error) {
@@ -1575,6 +1554,43 @@ app.post('/api/pipeline/enrich', async (req, res) => {
 });
 
 
-// Exportado sem iniciar uma porta. O mesmo backend é montado tanto pelo
-// Vite do AI Studio quanto pelo servidor Node de produção.
-export default app;
+// ----------------------------------------------------
+// 404 CATCH-ALL FOR /api (Ensures no /api route returns HTML)
+// ----------------------------------------------------
+app.all('/api/*', (req, res) => {
+  res.status(404).json({
+    error: 'Endpoint da API não encontrado',
+    path: req.path,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// ----------------------------------------------------
+// VITE MIDDLEWARE & SERVER STARTUP
+// ----------------------------------------------------
+
+async function startServer() {
+  if (process.env.NODE_ENV !== 'production') {
+    const vite = await createViteServer({
+      server: {
+        middlewareMode: true,
+        hmr: false,
+      },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  }
+
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Data Cleaning & CNPJ Server running on http://0.0.0.0:${PORT}`);
+  });
+}
+
+export { app, startServer };
+
