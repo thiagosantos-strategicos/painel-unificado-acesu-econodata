@@ -70,3 +70,14 @@ npm start
 - Empresas repetidas são consultadas apenas uma vez por processamento.
 - O backend estima tokens antes do lookup pago e retorna tokens estimados e consumidos.
 - Falhas individuais não interrompem o tratamento da planilha.
+
+## Compatibilidade com a prévia do Google AI Studio
+
+O backend Express é montado de duas maneiras:
+
+- como middleware do Vite, quando o AI Studio inicia somente a prévia do frontend;
+- pelo `start.ts`, quando o aplicativo é executado como servidor Node completo.
+
+Isso impede que chamadas para `/api/*` sejam desviadas para o `index.html`. Se a
+prévia estiver sem backend, o frontend mostra uma mensagem de diagnóstico em vez
+do erro genérico `Unexpected token '<'`.
