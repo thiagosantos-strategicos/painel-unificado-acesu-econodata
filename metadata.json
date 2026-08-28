@@ -1,0 +1,6 @@
+{
+  "name": "Painel de Confirmados - 6º Fórum de Prevenção de Perdas ACESU",
+  "description": "Dashboard executivo com ETL, classificação de cargos, identificação de CNPJ e enriquecimento fiscal e financeiro via Econodata.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
