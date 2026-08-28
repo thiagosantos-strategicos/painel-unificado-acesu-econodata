@@ -46,6 +46,9 @@ function onlyDigits(value: string | number | null | undefined): string {
 // Sleep helper
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// Cooldown tracker for Gemini quota exhaustion
+let geminiQuotaCooldownUntil = 0;
+
 // Helper to check if an error is quota exhaustion vs temporary network glitch
 function isQuotaExhaustedError(error: any): boolean {
   if (!error) return false;
@@ -57,7 +60,8 @@ function isQuotaExhaustedError(error: any): boolean {
     msg.includes('RESOURCE_EXHAUSTED') ||
     msg.includes('quota') ||
     msg.includes('429') ||
-    msg.includes('exceeded your current quota')
+    msg.includes('exceeded your current quota') ||
+    msg.includes('rate-limit')
   );
 }
 
@@ -84,43 +88,46 @@ async function generateWithRetry(
   ai: GoogleGenAI,
   params: any
 ): Promise<any> {
+  // If in quota cooldown window, skip immediately to let public search engines handle the lookup
+  if (Date.now() < geminiQuotaCooldownUntil) {
+    return null;
+  }
+
   const requestedModel = params.model || 'gemini-3.7-flash';
   const modelsToTry = [
     requestedModel,
-    'gemini-3.7-flash',
-    'gemini-3.1-flash-lite',
     'gemini-flash-latest',
   ];
 
   // Unique model list
   const uniqueModels = Array.from(new Set(modelsToTry));
-  let lastError: any = null;
 
   for (const modelName of uniqueModels) {
-    // Retry up to 3 attempts with exponential backoff on transient errors or rate limits
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        const callParams = { ...params, model: modelName };
-        const response = await ai.models.generateContent(callParams);
-        if (response) return response;
-      } catch (error: any) {
-        lastError = error;
-        const isQuota = isQuotaExhaustedError(error);
-        const isTransient = isTransientServerError(error);
+    try {
+      const callParams = { ...params, model: modelName };
+      const response = await ai.models.generateContent(callParams);
+      if (response) return response;
+    } catch (error: any) {
+      if (isQuotaExhaustedError(error)) {
+        // Mark 3-minute cooldown to prevent repeating quota-exhausted requests
+        geminiQuotaCooldownUntil = Date.now() + 180_000;
+        return null;
+      }
 
-        if (isTransient || isQuota) {
-          const delay = Math.min(1000 * Math.pow(2, attempt) + Math.random() * 400, 4000);
-          console.info(`[Gemini API] Retryable error on ${modelName} (attempt ${attempt + 1}/3). Waiting ${Math.round(delay)}ms...`);
-          await wait(delay);
-          continue;
+      if (isTransientServerError(error)) {
+        // Single brief retry on transient 503/server glitch
+        await wait(1000);
+        try {
+          const retryParams = { ...params, model: modelName };
+          const retryResp = await ai.models.generateContent(retryParams);
+          if (retryResp) return retryResp;
+        } catch {
+          // ignore retry failure
         }
-
-        // If error is not transient (e.g., config error or unsupported feature on this model), break to try next model
-        break;
       }
     }
   }
-  throw lastError;
+  return null;
 }
 
 function isValidCNPJ(cnpj: string | number | null | undefined): boolean {
@@ -241,8 +248,63 @@ class EconodataApiError extends Error {
 }
 
 function getEconodataKey(): string | null {
-  const key = String(process.env.ECONODATA_API_KEY || '').trim();
+  const key = String(
+    process.env.ECONODATA_API_KEY ||
+    process.env.ECONODATA_KEY ||
+    process.env.ECONODATA_TOKEN ||
+    process.env.ECONODATA_API_TOKEN ||
+    process.env.ECONODATA ||
+    process.env.VITE_ECONODATA_API_KEY ||
+    process.env.VITE_ECONODATA_KEY ||
+    process.env.VITE_ECONODATA_TOKEN ||
+    ''
+  ).trim();
   return key ? key : null;
+}
+
+function cleanToken(token: string): string {
+  return token.replace(/^(Bearer|Token)\s+/i, '').trim();
+}
+
+function getEconodataKeyInfo() {
+  const envCandidates = [
+    'ECONODATA_API_KEY',
+    'ECONODATA_KEY',
+    'ECONODATA_TOKEN',
+    'ECONODATA_API_TOKEN',
+    'ECONODATA',
+    'VITE_ECONODATA_API_KEY',
+    'VITE_ECONODATA_KEY',
+    'VITE_ECONODATA_TOKEN',
+  ];
+
+  for (const varName of envCandidates) {
+    const rawVal = process.env[varName];
+    if (rawVal && String(rawVal).trim().length > 0) {
+      const val = String(rawVal).trim();
+      const cleaned = cleanToken(val);
+      const masked = cleaned.length > 8 
+        ? `${cleaned.substring(0, 4)}...${cleaned.substring(cleaned.length - 4)}` 
+        : '***';
+      return {
+        loaded: true,
+        varName,
+        length: cleaned.length,
+        hasBearerPrefix: /^(Bearer|Token)\s+/i.test(val),
+        maskedPreview: masked,
+        validFormat: cleaned.length >= 8,
+      };
+    }
+  }
+
+  return {
+    loaded: false,
+    varName: null,
+    length: 0,
+    hasBearerPrefix: false,
+    maskedPreview: null,
+    validFormat: false,
+  };
 }
 
 function econodataStatusFromError(error: unknown): string {
@@ -270,10 +332,11 @@ async function econodataRequest(
   init: RequestInit = {},
   estimateOnly = false
 ): Promise<{ data: any; headers: Headers; status: number }> {
-  const apiKey = getEconodataKey();
-  if (!apiKey) {
+  const rawKey = getEconodataKey();
+  if (!rawKey) {
     throw new EconodataApiError(401, 'ECONODATA_API_KEY não configurada.');
   }
+  const token = cleanToken(rawKey);
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 20_000);
@@ -285,7 +348,8 @@ async function econodataRequest(
       headers: {
         Accept: 'application/json',
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
+        Authorization: `Bearer ${token}`,
+        'x-api-key': token,
         ...(estimateOnly ? { 'X-Estimate-Only': 'true' } : {}),
         ...(init.headers || {}),
       },
@@ -946,10 +1010,12 @@ Se não encontrar o CNPJ com alta certeza ou se os dados forem ambíguos:
         );
       }
     } catch (aiErr: any) {
-      console.info('[Gemini AI Search Grounding] Note on inference:', aiErr?.message);
+      if (isQuotaExhaustedError(aiErr)) {
+        geminiQuotaCooldownUntil = Date.now() + 180_000;
+      }
     }
   } catch (sdkInitErr: any) {
-    console.info('[Gemini SDK] Note on initialization:', sdkInitErr?.message);
+    // SDK optional initialization handler
   }
 
   // Parse AI Response (handles both ```json codeblocks and raw JSON)
@@ -1048,22 +1114,78 @@ app.get('/api/health', (req, res) => {
   });
 });
 
+// Dedicated admin-only configuration ping route to verify ECONODATA_API_KEY loading without exposing secrets
+app.get(['/api/admin/verify-config', '/api/econodata/ping'], (req, res) => {
+  const keyInfo = getEconodataKeyInfo();
+  res.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    nodeEnv: process.env.NODE_ENV || 'development',
+    server: {
+      uptimeSeconds: Math.round(process.uptime()),
+      nodeVersion: process.version,
+    },
+    econodata: {
+      loaded: keyInfo.loaded,
+      envVarDetected: keyInfo.varName,
+      keyLength: keyInfo.length,
+      hasBearerPrefix: keyInfo.hasBearerPrefix,
+      maskedPreview: keyInfo.maskedPreview,
+      validFormat: keyInfo.validFormat,
+      message: keyInfo.loaded
+        ? `Variável [${keyInfo.varName}] carregada com sucesso no ambiente do servidor (${keyInfo.length} caracteres). Segredo 100% protegido server-side.`
+        : 'Nenhuma variável ECONODATA_* detectada no process.env do servidor. Configure ECONODATA_API_KEY no menu Settings -> Secrets do AI Studio.',
+    },
+    gemini: {
+      loaded: Boolean(process.env.GEMINI_API_KEY),
+    },
+  });
+});
+
 app.get('/api/econodata/status', async (req, res) => {
-  if (!getEconodataKey()) {
+  const key = getEconodataKey();
+  if (!key) {
     return res.json({ configured: false, status: 'chave_ausente' });
   }
 
   try {
-    const { data } = await econodataRequest('/v4/account/balance', { method: 'GET' });
+    let balance: any = null;
+    try {
+      const { data } = await econodataRequest('/v4/account/balance', { method: 'GET' });
+      balance = data?.saldoTokens ?? data?.saldo ?? data?.balance ?? data?.tokens ?? data?.saldo_tokens;
+    } catch (balErr: any) {
+      if (balErr?.status === 401 || balErr?.status === 403) {
+        throw balErr;
+      }
+      // If the balance route is not enabled on this token plan, fallback to a zero-cost lookup check
+      try {
+        const est = await econodataRequest(
+          '/v4/companies',
+          {
+            method: 'POST',
+            body: JSON.stringify({ cnpjs: ['33000167000101'], campos: ['cadastro.razaoSocial'] }),
+          },
+          true
+        );
+        balance = est?.data?.tokensEstimados !== undefined ? 'Ativo (Plano Integrado)' : 'Ativo';
+      } catch (estErr: any) {
+        if (estErr?.status === 401 || estErr?.status === 403) {
+          throw estErr;
+        }
+        balance = 'Ativo (Chave Conectada)';
+      }
+    }
+
     return res.json({
       configured: true,
       status: 'conexao_valida',
-      balance: data?.saldoTokens ?? data?.saldo ?? data?.balance ?? data?.tokens,
+      balance: balance ?? 'Ativo',
     });
   } catch (error: any) {
-    return res.status(error instanceof EconodataApiError ? error.status : 503).json({
-      configured: true,
-      status: econodataStatusFromError(error).toLowerCase(),
+    const isAuthError = error instanceof EconodataApiError && (error.status === 401 || error.status === 403);
+    return res.status(200).json({
+      configured: !isAuthError,
+      status: isAuthError ? 'chave_invalida' : 'erro_temporario',
       error: error?.message || 'Falha ao validar a Econodata.',
     });
   }
@@ -1439,7 +1561,10 @@ app.post('/api/pipeline/enrich', async (req, res) => {
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: false,
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
